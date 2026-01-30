@@ -1,0 +1,460 @@
+﻿from __future__ import annotations
+
+import tkinter as tk
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta
+from pathlib import Path
+from tkinter import messagebox
+
+import pandas as pd
+
+from src.config.app_config import ENVS, EXCEL_BASE_DIR
+from src.email_sender import send_recon_email
+from src.excel_validator import validar_snapshots, normalizar_colunas_data
+from src.gui.dialogs import ask_string
+from src.gui.jira_bridge import try_create_jira, collect_jira_attachments, try_attach_only, attach_files_to_issue
+from src.gui.state import AppState
+from src.utils import (
+    get_env_config, show_dataframe_in_treeview, decide_email_type,
+    get_operating_date_from_df, operating_key_yyyy_mm_dd
+)
+
+
+@dataclass
+class Ctx:
+    root: object
+    widgets: dict
+    state: AppState
+    legacy_jobs: dict
+    job_state_by_date: dict
+    save_job_state: callable
+    app_state_save: callable
+    log: callable
+
+
+def _get_job_snapshot(tree_jobs):
+    snapshot = []
+    for item in tree_jobs.get_children():
+        job, job_id, status, rc = tree_jobs.item(item, "values")
+        snapshot.append({"job": job, "job_id": job_id, "status": status, "rc": rc})
+    return snapshot
+
+
+def update_button_states(ctx: Ctx):
+    env = ctx.widgets["env_var"].get()
+    st = ctx.state
+
+    ctx.widgets["run_bat_btn"].config(state="normal")
+    ctx.widgets["run_excel_btn"].config(state="normal" if st.bat_done else "disabled")
+    ctx.widgets["mark_excel_done_btn"].config(state="normal")
+
+    ctx.widgets["validate_excel_btn"].config(state="normal" if st.excel_done.get(env) else "disabled")
+    ctx.widgets["prepare_email_btn"].config(state="normal" if st.validate_done.get(env) else "disabled")
+
+    ctx.widgets["retry_jira_btn"].config(state="normal" if st.validate_done.get(env) else "disabled")
+
+
+def refresh_bat_status_label(ctx: Ctx):
+    st = ctx.state
+    var = ctx.widgets["bat_status_var"]
+    if st.bat_done:
+        var.set(f"BAT: DONE (last run {st.bat_last_run})" if st.bat_last_run else "BAT: DONE")
+    else:
+        var.set("BAT: NOT RUN")
+
+
+def on_run_bat(ctx: Ctx):
+    from src.bat_runner import run_bat
+
+    ctx.log("Running BAT...")
+    try:
+        run_bat()
+        ctx.state.bat_done = True
+        ctx.state.bat_last_run = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ctx.app_state_save(ctx.state)
+        ctx.log(f"BAT executed successfully ({ctx.state.bat_last_run}).")
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+        ctx.log(f"BAT execution failed: {e}")
+    finally:
+        update_button_states(ctx)
+        refresh_bat_status_label(ctx)
+
+
+def on_run_excel(ctx: Ctx):
+    from src.excel_runner import run_excel_macro
+
+    env = ctx.widgets["env_var"].get()
+    ctx.log(f"Running Excel macro for {env}...")
+    try:
+        run_excel_macro(env)
+        ctx.state.excel_done[env] = True
+        ctx.app_state_save(ctx.state)
+        ctx.log("Excel macro executed successfully.")
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+        ctx.log(f"Excel macro failed: {e}")
+    finally:
+        update_button_states(ctx)
+
+
+def on_mark_excel_done(ctx: Ctx):
+    env = ctx.widgets["env_var"].get()
+    ctx.state.excel_done[env] = True
+    ctx.app_state_save(ctx.state)
+    ctx.log(f"[MANUAL] Marked Excel as DONE for {env}.")
+    update_button_states(ctx)
+
+
+def _load_df_last4_for_email(env: str) -> pd.DataFrame:
+    env_cfg = get_env_config(env, ENVS)
+    filename = EXCEL_BASE_DIR / env_cfg["folder"] / env_cfg["file"]
+    df = pd.read_excel(filename, sheet_name="Overview", header=2, index_col=0)
+    df = df.dropna(axis=1, how="all")
+    df = normalizar_colunas_data(df)
+    return df.iloc[:, -4:]
+
+
+def on_validate_excel(ctx: Ctx):
+    env = ctx.widgets["env_var"].get()
+    ctx.log(f"Validating Excel for {env}...")
+
+    try:
+        prev_oper_key = ctx.state.operating_date_key
+
+        env_cfg = get_env_config(env, ENVS)
+        excel_path = EXCEL_BASE_DIR / env_cfg["folder"] / env_cfg["file"]
+
+        df = pd.read_excel(excel_path, sheet_name="Overview", header=2, index_col=0)
+        df = df.dropna(axis=1, how="all")
+        df = normalizar_colunas_data(df)
+
+        df_last4 = df.iloc[:, -4:]
+        df_final, status = validar_snapshots(df_last4)
+
+        oper_ddmmyyyy = get_operating_date_from_df(df_final)
+        oper_key = operating_key_yyyy_mm_dd(oper_ddmmyyyy)
+
+        ctx.state.operating_date_ddmmyyyy = oper_ddmmyyyy
+        ctx.state.operating_date_key = oper_key
+        ctx.state.validate_done[env] = True
+
+        # migra DRAFT -> JSON do dia
+        draft = ctx.state.draft_jobs_by_env.get(env, {})
+        if draft:
+            ctx.job_state_by_date.setdefault(oper_key, {})
+            ctx.job_state_by_date[oper_key].setdefault(env, {})
+            for job_name, payload in draft.items():
+                ctx.job_state_by_date[oper_key][env][job_name] = payload
+
+            ctx.state.draft_jobs_by_env[env] = {}
+            ctx.save_job_state()
+            ctx.app_state_save(ctx.state)
+            ctx.log(f"âœ… Migrated DRAFT job state to JSON for {env} @ {oper_key}.")
+
+        show_dataframe_in_treeview(ctx.widgets["overview_tree"], df_final)
+
+        if status == "duplicado":
+            ctx.log(f"âš ï¸ Excel {env}: DUPLICATED snapshots (allowed)")
+        elif status == "quase_duplicado":
+            ctx.log(f"âš ï¸ Excel {env}: ALMOST duplicated snapshots (allowed)")
+        else:
+            ctx.log(f"âœ… Excel {env}: snapshots OK")
+
+        # se mudou operating date, recarrega jobs para evitar â€œrodada antiga na telaâ€
+        if prev_oper_key and prev_oper_key != oper_key:
+            ctx.log(f"â„¹ï¸ Operating date changed: {prev_oper_key} -> {oper_key}. Reloading jobs view...")
+
+        refresh_env_summary(ctx)
+        populate_jobs_tree(ctx)
+        update_button_states(ctx)
+
+    except Exception as e:
+        ctx.log(f"[ERROR] Excel validation failed: {e}")
+        messagebox.showerror("Excel validation failed", str(e))
+        update_button_states(ctx)
+
+
+def refresh_env_summary(ctx: Ctx):
+    summary_box = ctx.widgets["summary_box"]
+    summary_box.config(state="normal")
+    summary_box.delete("1.0", tk.END)
+
+    oper_key = get_current_oper_key(ctx)
+    if not oper_key:
+        summary_box.insert(tk.END, "Operating date not defined yet (validate Excel to set movement date).\n")
+        summary_box.insert(tk.END, "Summary will show per-env state for that movement date.\n")
+        summary_box.config(state="disabled")
+        return
+
+    day_state = ctx.job_state_by_date.get(oper_key, {})
+    summary_box.insert(tk.END, f"Movement date (key): {oper_key}\n")
+
+    for env in ctx.legacy_jobs.keys():
+        jobs = day_state.get(env, {})
+        if not jobs:
+            line = f"{env}: no data\n"
+        else:
+            ok = sum(1 for j in jobs.values() if j.get("status") == "OK")
+            failed = sum(1 for j in jobs.values() if j.get("status") == "FAILED")
+            pending = sum(1 for j in jobs.values() if j.get("status") == "Not Run")
+            line = f"{env}: OK={ok}, FAILED={failed}, NOT RUN={pending}\n"
+        summary_box.insert(tk.END, line)
+
+    summary_box.config(state="disabled")
+
+
+def get_current_oper_key(ctx: Ctx):
+    return ctx.state.operating_date_key
+
+
+def ensure_oper_env_struct(ctx: Ctx, oper_key: str, env: str):
+    ctx.job_state_by_date.setdefault(oper_key, {})
+    ctx.job_state_by_date[oper_key].setdefault(env, {})
+
+
+def populate_jobs_tree(ctx: Ctx):
+    tree_jobs = ctx.widgets["tree_jobs"]
+    tree_jobs.delete(*tree_jobs.get_children())
+
+    env = ctx.widgets["env_var"].get()
+    oper_key = get_current_oper_key(ctx)
+
+    # sem operating date -> usa DRAFT
+    if not oper_key:
+        draft = ctx.state.draft_jobs_by_env.get(env, {})
+        for job_name, job_id in ctx.legacy_jobs.get(env, []):
+            saved = draft.get(job_name)
+            status = saved.get("status", "Not Run") if saved else "Not Run"
+            rc = saved.get("rc", "") if saved else ""
+            tree_jobs.insert("", "end", values=[job_name, job_id, status, rc])
+
+        ctx.log(f"Jobs loaded for {env} (no operating date yet) [DRAFT].")
+        refresh_env_summary(ctx)
+        update_button_states(ctx)
+        return
+
+    ensure_oper_env_struct(ctx, oper_key, env)
+    env_state = ctx.job_state_by_date[oper_key][env]
+
+    for job_name, job_id in ctx.legacy_jobs.get(env, []):
+        saved = env_state.get(job_name)
+        status = saved.get("status", "Not Run") if saved else "Not Run"
+        rc = saved.get("rc", "") if saved else ""
+        tree_jobs.insert("", "end", values=[job_name, job_id, status, rc])
+
+    ctx.log(f"Jobs loaded for {env} (movement date key: {oper_key}).")
+    refresh_env_summary(ctx)
+    update_button_states(ctx)
+
+
+def on_job_double_click(ctx: Ctx, event):
+    tree = ctx.widgets["tree_jobs"]
+    item_id = tree.identify_row(event.y)
+    if not item_id:
+        return
+
+    job, job_id, status, rc = tree.item(item_id, "values")
+
+    if status == "Not Run":
+        status, rc = "OK", "0"
+    elif status == "OK":
+        status, rc = "FAILED", "RC>0"
+    else:
+        status, rc = "Not Run", ""
+
+    tree.item(item_id, values=[job, job_id, status, rc])
+
+    env = ctx.widgets["env_var"].get()
+    oper_key = get_current_oper_key(ctx)
+
+    # sem operating date -> DRAFT + persist
+    if not oper_key:
+        ctx.state.draft_jobs_by_env.setdefault(env, {})
+        ctx.state.draft_jobs_by_env[env][job] = {"job_id": job_id, "status": status, "rc": rc}
+        ctx.app_state_save(ctx.state)
+        ctx.log(f"ðŸ“ Saved job state to DRAFT for {env} (persisted).")
+        refresh_env_summary(ctx)
+        update_button_states(ctx)
+        return
+
+    # com operating date -> JSON do dia
+    ensure_oper_env_struct(ctx, oper_key, env)
+    ctx.job_state_by_date[oper_key][env][job] = {"job_id": job_id, "status": status, "rc": rc}
+    ctx.save_job_state()
+    refresh_env_summary(ctx)
+    update_button_states(ctx)
+
+
+def _append_excel_to_attachments(env: str, files: list[Path]) -> list[Path]:
+    # anexar o Excel tambÃ©m
+    env_cfg = get_env_config(env, ENVS)
+    excel_path = EXCEL_BASE_DIR / env_cfg["folder"] / env_cfg["file"]
+    if excel_path.exists() and excel_path.is_file():
+        files.append(excel_path)
+    return files
+
+
+def on_prepare_email(ctx: Ctx):
+    env = ctx.widgets["env_var"].get()
+    tree_jobs = ctx.widgets["tree_jobs"]
+    job_snapshot = _get_job_snapshot(tree_jobs)
+
+    email_type = decide_email_type(job_snapshot, override_s1=False)
+    if email_type == "WAIT":
+        messagebox.showinfo("Waiting legacy jobs", "Some legacy jobs have not finished yet.")
+        return
+
+    date_for_email = ctx.state.operating_date_ddmmyyyy or (date.today() - timedelta(days=1)).strftime("%d-%m-%Y")
+
+    df_last4 = None
+    if email_type != "FLOW_STOPPED":
+        df_last4 = _load_df_last4_for_email(env)
+
+    jira_key = ctx.state.last_jira_key.get(env)
+
+    # Jira automÃ¡tico sÃ³ se:
+    # - ainda nÃ£o tem EVT no state
+    # - tem df_last4
+    # - tem operating date
+    # - BAT done (sync + arquivos)
+    if (not jira_key and df_last4 is not None and ctx.state.operating_date_ddmmyyyy and ctx.state.bat_done):
+        try:
+            files = collect_jira_attachments(env, ctx.legacy_jobs, log=ctx.log)
+            files = _append_excel_to_attachments(env, files)
+
+            if not files:
+                ctx.log("âš ï¸ No attachments found (CSV/Excel). Jira will be created without attachments.")
+            else:
+                ctx.log(f"ðŸ“Ž Attachments to send: {len(files)} file(s)")
+
+            issue_key = try_create_jira(
+                env=env,
+                df_last4=df_last4,
+                operating_date_ddmmyyyy=ctx.state.operating_date_ddmmyyyy,
+                files=files,
+            )
+
+            if issue_key:
+                ctx.state.last_jira_key[env] = issue_key
+                ctx.app_state_save(ctx.state)
+                jira_key = issue_key
+                ctx.log(f"âœ… Jira auto-created: {issue_key}")
+            else:
+                ctx.log("â„¹ï¸ Jira not created (world-ideal scenario).")
+
+        except Exception as e:
+            ctx.log(f"[JIRA ERROR] Auto-create failed: {e}")
+            jira_key = "NO-TICKET"
+
+    elif not ctx.state.bat_done:
+        ctx.log("âš ï¸ BAT not done yet â€” skipping Jira auto-create (sync not guaranteed).")
+
+    if not jira_key:
+        jira_key = "NO-TICKET"
+
+    send_recon_email(
+        env=env,
+        df=df_last4,
+        jira_event=jira_key,
+        date_for_email=date_for_email,
+        email_type=email_type,
+        job_snapshot=job_snapshot,
+        draft_only=True,
+    )
+
+    ctx.log(f"ðŸ“§ Email prepared ({email_type}) | Jira={jira_key}")
+
+
+def on_retry_jira_upload(ctx: Ctx):
+    env = ctx.widgets["env_var"].get()
+
+    if not ctx.state.bat_done:
+        messagebox.showinfo("Info", "RUN BAT first (it will sync/copy files).")
+        return
+    if not ctx.state.operating_date_ddmmyyyy:
+        messagebox.showinfo("Info", "Validate Excel first (operating date not defined).")
+        return
+
+    last_evt = ctx.state.last_jira_key.get(env)
+
+    target_evt = None
+    create_new = False
+
+    if last_evt:
+        choice = messagebox.askyesnocancel(
+            "Retry Jira Upload",
+            f"Choose target:\n\n"
+            f"YES  = attach files to existing event:\n{last_evt}\n\n"
+            f"NO   = create a NEW event and attach files\n\n"
+            f"CANCEL = type/paste another EVT key"
+        )
+        if choice is True:
+            target_evt = last_evt
+        elif choice is False:
+            create_new = True
+        else:
+            typed = ask_string("Jira", "Paste target Jira ticket (EVT-XXXXXX):", initialvalue=last_evt)
+            if not typed:
+                return
+            target_evt = typed.strip().upper()
+    else:
+        create_new = messagebox.askyesno("Retry Jira Upload",
+                                         "No existing Jira event found.\n\nCreate a NEW event now?")
+        if not create_new:
+            typed = ask_string("Jira", "Paste target Jira ticket (EVT-XXXXXX):")
+            if not typed:
+                return
+            target_evt = typed.strip().upper()
+
+    try:
+        files = collect_jira_attachments(env, ctx.legacy_jobs, log=ctx.log)
+        files = _append_excel_to_attachments(env, files)
+
+        if not files:
+            messagebox.showwarning("No files found", "No CSV/Excel files were found. Nothing to upload.")
+            ctx.log("âš ï¸ No attachment files found. Abort upload.")
+            return
+
+        ctx.log(f"ðŸ“Ž Found {len(files)} attachment files for env={env}.")
+
+        # 1) anexar no EVT existente
+        if target_evt and not create_new:
+            attached = attach_files_to_issue(target_evt, files, skip_existing=True, log=ctx.log)
+            if not attached:
+                ctx.log(f"â„¹ï¸ Nothing new to upload to {target_evt} (all files already attached).")
+                messagebox.showinfo("Jira Upload", f"No new files to upload.\n{target_evt} already has them.")
+                return
+
+            ctx.log(f"âœ… Uploaded {len(attached)} new file(s) to {target_evt}")
+
+            messagebox.showinfo("Success", f"Uploaded {len(attached)} new file(s) to {target_evt}")
+            ctx.state.last_jira_key[env] = target_evt
+            ctx.app_state_save(ctx.state)
+            ctx.log(f"âœ… Uploaded {len(attached)} file(s) to existing Jira: {target_evt}")
+            messagebox.showinfo("Success", f"Uploaded {len(attached)} file(s) to {target_evt}")
+            return
+
+        # 2) criar novo EVT e anexar
+        df_last4 = _load_df_last4_for_email(env)
+
+        issue_key = try_create_jira(
+            env=env,
+            df_last4=df_last4,
+            operating_date_ddmmyyyy=ctx.state.operating_date_ddmmyyyy,
+            files=files,
+        )
+
+        if not issue_key:
+            ctx.log("â„¹ï¸ Jira not created (rule returned None).")
+            messagebox.showinfo("Info", "Jira not created (rule logic prevented creation).")
+            return
+
+        ctx.state.last_jira_key[env] = issue_key
+        ctx.app_state_save(ctx.state)
+        ctx.log(f"âœ… Jira created and files uploaded: {issue_key}")
+        messagebox.showinfo("Success", f"Jira created: {issue_key}\nFiles uploaded.")
+
+    except Exception as e:
+        ctx.log(f"[JIRA ERROR] Retry failed: {e}")
+        messagebox.showerror("Jira error", str(e))

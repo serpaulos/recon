@@ -1,0 +1,9 @@
+{
+  "errorMessages": [],
+  "errors": {
+    "customfield_10225": "Environment is required.",
+    "customfield_10218": "Assignment group is required.",
+    "customfield_10219": "Category - Subcategory is required.",
+    "customfield_10333": "Impacted CI is required."
+  }
+}

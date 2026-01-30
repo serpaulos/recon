@@ -1,0 +1,23 @@
+{
+  "run_date_key": "2026-01-30",
+  "bat_done": true,
+  "bat_last_run": "2026-01-30 14:50:27",
+  "excel_done": {
+    "PROD": false,
+    "DEMO": true,
+    "FUNK": false
+  },
+  "validate_done": {
+    "PROD": false,
+    "DEMO": true,
+    "FUNK": false
+  },
+  "last_jira_key": {
+    "PROD": null,
+    "DEMO": "EVT-110455",
+    "FUNK": null
+  },
+  "operating_date_ddmmyyyy": "29-01-2026",
+  "operating_date_key": "2026-01-29",
+  "draft_jobs_by_env": {}
+}
